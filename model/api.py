@@ -197,5 +197,5 @@ def predict():
 
     return jsonify({"result": "phishing" if prediction == 1 else "safe"})
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# if __name__ == '__main__':
+#     app.run(debug=True)
