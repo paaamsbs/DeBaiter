@@ -40,7 +40,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 import numpy as np
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
 import gc
 
 app = Flask(__name__)
@@ -63,9 +62,6 @@ def load_model_if_needed():
 SHORTENERS = frozenset({"bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "is.gd", "buff.ly", "q-r.to",
               "lnkd.in", "rb.gy", "cutt.ly", "rebrand.ly", "tr.im", "u.to", "x.co", "j.mp", "l.ead.me",
               "clck.ru", "gg.gg", "shorter.me", "shorturl.at", "bl.ink", "sniply.io", "short.io", "qrco.de"})
-
-# Use a smaller thread pool to reduce memory overhead
-executor = ThreadPoolExecutor(max_workers=3)
 
 def is_shortened_url(url):
     parsed = urlparse(url)
