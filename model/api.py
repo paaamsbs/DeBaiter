@@ -43,50 +43,64 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec
 import numpy as np
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
+import gc
 
 app = Flask(__name__)
 
-model_zip = 'random_forest_model.zip'
-extracted_model = 'random_forest_model.pkl'
+# Lazy loading for models
+model = None
+ohe = None
+expected_encoded_cols = None
 
-# Function to extract the zip file
-def extract_model(zip_path, extract_to_path):
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_to_path)
-
-# Extract the model if not already extracted
-if not os.path.exists(extracted_model):
-    extract_model(model_zip, '.')
-
-# Load the pre-trained model and one-hot encoder
-model = joblib.load(extracted_model)
-ohe = joblib.load('onehot_encoder.pkl')
-
-# Extract expected one-hot encoded column names
-expected_encoded_cols = ohe.get_feature_names_out(['ssl_issuer'])
+def load_models():
+    """Lazy load models only when needed"""
+    global model, ohe, expected_encoded_cols
+    
+    if model is None:
+        model_zip = 'random_forest_model.zip'
+        extracted_model = 'random_forest_model.pkl'
+        
+        # Extract the model if not already extracted
+        if not os.path.exists(extracted_model):
+            with zipfile.ZipFile(model_zip, 'r') as zip_ref:
+                zip_ref.extractall('.')
+        
+        # Load the pre-trained model and one-hot encoder
+        model = joblib.load(extracted_model)
+        ohe = joblib.load('onehot_encoder.pkl')
+        
+        # Extract expected one-hot encoded column names
+        expected_encoded_cols = ohe.get_feature_names_out(['ssl_issuer'])
 
 # URL Cleaning Functions
-SHORTENERS = {"bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "is.gd", "buff.ly", "q-r.to",
-              "lnkd.in", "rb.gy", "cutt.ly", "rebrand.ly", "tr.im", "u.to", "x.co", "j.mp", "l.ead.me",
-              "clck.ru", "gg.gg", "shorter.me", "shorturl.at", "bl.ink", "sniply.io", "short.io", "qrco.de"}
+SHORTENERS = frozenset({
+    "bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "is.gd", "buff.ly", "q-r.to",
+    "lnkd.in", "rb.gy", "cutt.ly", "rebrand.ly", "tr.im", "u.to", "x.co", "j.mp", 
+    "l.ead.me", "clck.ru", "gg.gg", "shorter.me", "shorturl.at", "bl.ink", 
+    "sniply.io", "short.io", "qrco.de"
+})
 
-# Use a thread pool for concurrent URL expansion requests
-executor = ThreadPoolExecutor(max_workers=5)
+# Create a smaller thread pool with fewer workers to reduce memory overhead
+executor = ThreadPoolExecutor(max_workers=2)
 
 def is_shortened_url(url):
     parsed = urlparse(url)
     domain_cleaned = parsed.netloc.lower().strip()
     return domain_cleaned in SHORTENERS or bool(re.fullmatch(r"/[A-Za-z0-9_-]{4,10}", parsed.path))
 
-# Cache results for the same URL
-@lru_cache(maxsize=100)
-
+# Limit cache size to reduce memory usage
+@lru_cache(maxsize=50)
 def expand_short_url(url):
     if not is_shortened_url(url):
         return url
     try:
-        response = requests.head(url, allow_redirects=True, timeout=1)
-        return response.url
+        # Use a session with fewer default settings
+        with requests.Session() as session:
+            # Disable keep-alive to release connections immediately
+            session.headers['Connection'] = 'close'
+            # Add timeout to prevent hanging connections
+            response = session.head(url, allow_redirects=True, timeout=1)
+            return response.url
     except requests.RequestException:
         return None
 
@@ -99,14 +113,9 @@ def clean_url(url):
     cleaned = urlunparse((parsed.scheme, netloc, parsed.path.split("?")[0], "", "", ""))
     return cleaned.rstrip("/")
 
-# Feature Extraction Functions
-dns_cache = {}
-
-# Cache DNS record lookup
-@lru_cache(maxsize=100)
-
+# Reduce DNS cache size
+@lru_cache(maxsize=50)
 def get_dns_records(domain, record_type):
-    cache_key = f"{domain}_{record_type}"
     try:
         answers = dns.resolver.resolve(domain, record_type)
         return len(answers)
@@ -116,20 +125,33 @@ def get_dns_records(domain, record_type):
 def get_ssl_info(domain):
     ssl_info = {"ssl_valid_days": -1, "ssl_common_name_mismatch": -1, "ssl_self_signed": -1, "ssl_key_size": -1}
     try:
+        # Create a new context for each connection to avoid resource leakage
         ctx = ssl.create_default_context()
-        with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
-            s.settimeout(5)
-            s.connect((domain, 443))
-            cert = x509.load_der_x509_certificate(s.getpeercert(binary_form=True))
+        s = socket.socket()
+        s.settimeout(3)  # Reduced timeout
+        ctx_socket = ctx.wrap_socket(s, server_hostname=domain)
+        
+        try:
+            ctx_socket.connect((domain, 443))
+            cert = x509.load_der_x509_certificate(ctx_socket.getpeercert(binary_form=True))
             ssl_info.update({
                 "ssl_valid_days": (cert.not_valid_after_utc - cert.not_valid_before_utc).days,
                 "ssl_key_size": cert.public_key().key_size if isinstance(cert.public_key(), (rsa.RSAPublicKey, ec.EllipticCurvePublicKey)) else -1,
                 "ssl_self_signed": int(cert.issuer == cert.subject),
                 "ssl_common_name_mismatch": int(cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value != domain)
             })
+        finally:
+            # Ensure we always close the socket
+            ctx_socket.close()
     except Exception:
         pass
     return ssl_info
+
+# Pre-compile regex pattern for IP detection
+IP_PATTERN = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+
+# Common suspicious keywords 
+SUSPICIOUS_KEYWORDS = frozenset(["login", "verify", "account", "update", "secure", "bank", "confirm", "activate", "signin", "billing"])
 
 def extract_features(url):
     parsed_url = urlparse(url)
@@ -138,33 +160,38 @@ def extract_features(url):
 
     # Add default ssl_issuer in case it is not found
     ssl_issuer = 'Unknown'
+    
+    ssl_info = get_ssl_info(domain)
 
-    try:
-        ssl_info = get_ssl_info(domain)
-        ssl_issuer = ssl_info.get('ssl_issuer', 'Unknown')
-    except Exception as e:
-        print(f"SSL info error for {domain}: {e}")
-
-    # Prepare feature dictionary
+    # Use more efficient string operations
+    url_lower = url.lower()
+    path = parsed_url.path
+    
+    # Count suspicious keywords more efficiently
+    suspicious_count = sum(url_lower.count(k) for k in SUSPICIOUS_KEYWORDS)
+    
+    # Prepare feature dictionary - only calculate what's needed
     features = {
         "ssl_issuer": ssl_issuer,
         "url_length": len(url),
         "num_subdomains": parsed_url.netloc.count('.'),
         "domain_length": len(domain_info.domain),
         "https": int(parsed_url.scheme == "https"),
-        "ip_in_url": int(bool(re.match(r"^(\d{1,3}\.){3}\d{1,3}$", parsed_url.netloc))),
-        "path_length": len(parsed_url.path),
+        "ip_in_url": int(bool(IP_PATTERN.match(parsed_url.netloc))),
+        "path_length": len(path),
         "num_special_chars": sum(url.count(ch) for ch in "@?-=_&% ."),
         "num_digits": sum(c.isdigit() for c in url),
-        "tld_in_path": int(domain_info.suffix in parsed_url.path),
-        "dot_count_in_path": parsed_url.path.count('.'),
-        "num_slashes_in_path": parsed_url.path.count('/'),
-        "suspicious_keyword": sum(url.lower().count(k) for k in ["login", "verify", "account", "update", "secure", "bank", "confirm", "activate", "signin", "billing"]),
+        "tld_in_path": int(domain_info.suffix in path),
+        "dot_count_in_path": path.count('.'),
+        "num_slashes_in_path": path.count('/'),
+        "suspicious_keyword": suspicious_count,
         "num_dns_records": get_dns_records(domain, "A"),
         "mx_record_exists": int(get_dns_records(domain, "MX") > 0),
         "num_ns_records": get_dns_records(domain, "NS"),
-        **get_ssl_info(domain)
     }
+    
+    # Merge SSL info into features
+    features.update(ssl_info)
 
     return features
 
@@ -177,6 +204,10 @@ FEATURE_ORDER = [
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    # Load models only when needed
+    if model is None:
+        load_models()
+    
     data = request.get_json(force=True)
     url = data.get('url')
     if not url:
@@ -189,25 +220,40 @@ def predict():
 
     # Extract features from the cleaned URL
     features_dict = extract_features(cleaned)
-    features_df = pd.DataFrame([features_dict])
-
-    # Handle missing 'ssl_issuer' by adding it with a default value
-    if 'ssl_issuer' not in features_df.columns:
-        features_df['ssl_issuer'] = 'Unknown'
     
-    # One-Hot Encoding for 'ssl_issuer'
-    encoded_cat_features = ohe.transform(features_df[['ssl_issuer']])
-    encoded_cat_df = pd.DataFrame(encoded_cat_features, columns=expected_encoded_cols)
+    # Use a more memory-efficient approach instead of pandas
+    # Create a feature array directly
+    X = np.zeros((1, len(FEATURE_ORDER) + len(expected_encoded_cols)))
     
-    # Drop 'ssl_issuer' column before joining encoded features
-    features_df = features_df.drop(columns=['ssl_issuer'], errors='ignore')
-
-    # Join the one-hot encoded features with the original features
-    features_df = features_df.join(encoded_cat_df)
-
-    prediction = model.predict(features_df)[0]
-
+    # Fill in numerical features
+    for i, feature in enumerate(FEATURE_ORDER):
+        X[0, i] = features_dict.get(feature, 0)
+    
+    # Handle categorical features (ssl_issuer)
+    ssl_issuer = features_dict.get('ssl_issuer', 'Unknown')
+    one_hot = ohe.transform([[ssl_issuer]])
+    
+    # Add one-hot encoded features to the array
+    for i, val in enumerate(one_hot[0]):
+        X[0, len(FEATURE_ORDER) + i] = val
+    
+    # Make prediction
+    prediction = model.predict(X)[0]
+    
+    # Force garbage collection to release memory
+    gc.collect()
+    
     return jsonify({"result": "phishing" if prediction == 1 else "safe"})
+
+# Add a route to explicitly unload models when needed
+@app.route('/unload_models', methods=['POST'])
+def unload_models():
+    global model, ohe, expected_encoded_cols
+    model = None
+    ohe = None
+    expected_encoded_cols = None
+    gc.collect()
+    return jsonify({"status": "Models unloaded successfully"})
 
 # if __name__ == '__main__':
 #     app.run(debug=True)
