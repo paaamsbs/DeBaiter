@@ -55,7 +55,7 @@ def extract_model(zip_path, extract_to_path):
         zip_ref.extractall(extract_to_path)
 
 # Extract the model if not already extracted
-# if not os.path.exists(extracted_model):
+if not os.path.exists(extracted_model):
     extract_model(model_zip, '.')
 
 # Load the pre-trained model and one-hot encoder
