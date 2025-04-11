@@ -35,7 +35,7 @@ import socket
 import ssl
 import dns.resolver
 import tldextract
-import psutil
+import zipfile
 import os
 from urllib.parse import urlparse, urlunparse
 from cryptography import x509
@@ -46,8 +46,20 @@ from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
+model_zip = 'random_forest_model.zip'
+extracted_model = 'random_forest_model.pkl'
+
+# Function to extract the zip file
+def extract_model(zip_path, extract_to_path):
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to_path)
+
+# Extract the model if not already extracted
+# if not os.path.exists(extracted_model):
+    extract_model(model_zip, '.')
+
 # Load the pre-trained model and one-hot encoder
-model = joblib.load('random_forest_model.pkl')
+model = joblib.load(extracted_model)
 ohe = joblib.load('onehot_encoder.pkl')
 
 # Extract expected one-hot encoded column names
