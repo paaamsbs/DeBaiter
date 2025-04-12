@@ -15,15 +15,14 @@ Key functionalities:
   - Suspicious keywords in the URL.
   - DNS records (A, MX, NS records).
 - Model prediction: The script uses a pre-trained Random Forest model to predict if the URL is phishing or safe.
-  - The model has been trained on various URL features and is loaded using `joblib`.
-- One-Hot Encoding: The `ssl_issuer` feature is one-hot encoded using a pre-trained OneHotEncoder.
+  - The model has been trained on various URL features and is loaded using joblib.
+- One-Hot Encoding: The ssl_issuer feature is one-hot encoded using a pre-trained OneHotEncoder.
 
 Endpoints:
 - POST /predict: Accepts a JSON payload with a "url" key and returns a prediction ("phishing" or "safe").
 
 Note:
 - This script uses Flask for API deployment and provides a development server for testing.
-- Production-ready WSGI server (e.g., Gunicorn or uWSGI) must be used when deploying to production.
 """
 
 from flask import Flask, request, jsonify
@@ -38,45 +37,51 @@ import tldextract
 from urllib.parse import urlparse, urlunparse
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
-import tracemalloc
+from flask_cors import CORS
+from dotenv import load_dotenv
+import gc
+
+load_dotenv()
 
 app = Flask(__name__)
+CORS(app)
 
-tracemalloc.start()
+# Use lazy loading for the model
+_model = None
+_ohe = None
+_expected_encoded_cols = None
 
-# Load the pre-trained model and one-hot encoder
-model = joblib.load('random_forest_model.pkl', mmap_mode='r')
-ohe = joblib.load('onehot_encoder.pkl')
+def get_model():
+    global _model
+    if _model is None:
+        _model = joblib.load('random_forest_model.pkl', mmap_mode='r')
+    return _model
 
-print("Memory used (MB):", tracemalloc.get_traced_memory()[1] / 1024 / 1024)
-
-# Extract expected one-hot encoded column names
-expected_encoded_cols = ohe.get_feature_names_out(['ssl_issuer'])
+def get_ohe():
+    global _ohe, _expected_encoded_cols
+    if _ohe is None:
+        _ohe = joblib.load('onehot_encoder.pkl')
+        _expected_encoded_cols = _ohe.get_feature_names_out(['ssl_issuer'])
+    return _ohe, _expected_encoded_cols
 
 # URL Cleaning Functions
 SHORTENERS = {"bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "is.gd", "buff.ly", "q-r.to",
               "lnkd.in", "rb.gy", "cutt.ly", "rebrand.ly", "tr.im", "u.to", "x.co", "j.mp", "l.ead.me",
               "clck.ru", "gg.gg", "shorter.me", "shorturl.at", "bl.ink", "sniply.io", "short.io", "qrco.de"}
 
-# Use a thread pool for concurrent URL expansion requests
-executor = ThreadPoolExecutor(max_workers=5)
-
 def is_shortened_url(url):
     parsed = urlparse(url)
     domain_cleaned = parsed.netloc.lower().strip()
     return domain_cleaned in SHORTENERS or bool(re.fullmatch(r"/[A-Za-z0-9_-]{4,10}", parsed.path))
 
-# Cache results for the same URL
-@lru_cache(maxsize=100)
-
 def expand_short_url(url):
     if not is_shortened_url(url):
         return url
+    
     try:
         response = requests.head(url, allow_redirects=True, timeout=1)
-        return response.url
+        expanded_url = response.url
+        return expanded_url
     except requests.RequestException:
         return None
 
@@ -90,13 +95,7 @@ def clean_url(url):
     return cleaned.rstrip("/")
 
 # Feature Extraction Functions
-dns_cache = {}
-
-# Cache DNS record lookup
-@lru_cache(maxsize=100)
-
 def get_dns_records(domain, record_type):
-    cache_key = f"{domain}_{record_type}"
     try:
         answers = dns.resolver.resolve(domain, record_type)
         return len(answers)
@@ -108,7 +107,7 @@ def get_ssl_info(domain):
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
-            s.settimeout(5)
+            s.settimeout(3)  # Reduced timeout to save resources
             s.connect((domain, 443))
             cert = x509.load_der_x509_certificate(s.getpeercert(binary_form=True))
             ssl_info.update({
@@ -153,20 +152,20 @@ def extract_features(url):
         "num_dns_records": get_dns_records(domain, "A"),
         "mx_record_exists": int(get_dns_records(domain, "MX") > 0),
         "num_ns_records": get_dns_records(domain, "NS"),
-        **get_ssl_info(domain)
+        **ssl_info
     }
 
     return features
 
-FEATURE_ORDER = [
-    "url_length", "num_subdomains", "domain_length", "https", "ip_in_url", "path_length",
-    "num_special_chars", "num_digits", "tld_in_path", "dot_count_in_path", "num_slashes_in_path",
-    "suspicious_keyword", "num_dns_records", "mx_record_exists", "num_ns_records",
-    "ssl_valid_days", "ssl_common_name_mismatch", "ssl_self_signed", "ssl_key_size"
-]
+# Add periodic garbage collection
+def trigger_gc():
+    gc.collect()
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    # Trigger garbage collection on each request
+    trigger_gc()
+    
     data = request.get_json(force=True)
     url = data.get('url')
     if not url:
@@ -179,11 +178,17 @@ def predict():
 
     # Extract features from the cleaned URL
     features_dict = extract_features(cleaned)
+    
+    # Use dict to DataFrame conversion only when needed
     features_df = pd.DataFrame([features_dict])
 
     # Handle missing 'ssl_issuer' by adding it with a default value
     if 'ssl_issuer' not in features_df.columns:
         features_df['ssl_issuer'] = 'Unknown'
+    
+    # Get model and encoder on demand
+    model = get_model()
+    ohe, expected_encoded_cols = get_ohe()
     
     # One-Hot Encoding for 'ssl_issuer'
     encoded_cat_features = ohe.transform(features_df[['ssl_issuer']])
@@ -195,11 +200,16 @@ def predict():
     # Join the one-hot encoded features with the original features
     features_df = features_df.join(encoded_cat_df)
 
+    # Make prediction
     prediction = model.predict(features_df)[0]
 
-    print("Memory used (MB):", tracemalloc.get_traced_memory()[1] / 1024 / 1024)
-
+    # Explicitly delete objects to free memory
+    del features_df
+    del encoded_cat_df
+    del features_dict
+    del encoded_cat_features
+    
     return jsonify({"result": "phishing" if prediction == 1 else "safe"})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=8080)
