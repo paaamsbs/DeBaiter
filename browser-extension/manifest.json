@@ -11,6 +11,9 @@
         "run_at": "document_end"
       }
     ],
-    "host_permissions": ["*://*/*"]
+    "host_permissions": [
+      "https://*.facebook.com/*",
+      "https://debaiter-35538346792.asia-southeast1.run.app/*"
+    ]
   }
   
