@@ -79,11 +79,13 @@ def expand_short_url(url):
         return url
     
     try:
-        response = requests.head(url, allow_redirects=True, timeout=1)
-        expanded_url = response.url
-        return expanded_url
+        session = requests.Session()
+        session.max_redirects = 5
+        response = session.get(url, allow_redirects=True, timeout=5)
+
+        return response.url
     except requests.RequestException:
-        return None
+        return url
 
 def clean_url(url):
     url = expand_short_url(url)
@@ -209,7 +211,10 @@ def predict():
     del features_dict
     del encoded_cat_features
     
-    return jsonify({"result": "phishing" if prediction == 1 else "safe"})
+    return jsonify({
+        "result": "phishing" if prediction == 1 else "safe",
+        "cleaned_url": cleaned
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)
