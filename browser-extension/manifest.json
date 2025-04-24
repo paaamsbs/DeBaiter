@@ -3,7 +3,6 @@
     "name": "DeBaiter",
     "version": "1.0",
     "description": "",
-    "permissions": ["activeTab", "scripting"],
     "content_scripts": [
       {
         "matches": ["*://*.facebook.com/*"],
